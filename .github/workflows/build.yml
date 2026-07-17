@@ -1,0 +1,135 @@
+name: Build RatioJuris Releases
+
+on:
+  release:
+    types: [created]
+  workflow_dispatch:
+
+permissions:
+  contents: write   # allows creating and uploading release assets
+  packages: write   # allows publishing packages if needed
+  actions: read     # default safe read access for actions
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}-${{ matrix.arch }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            arch: 64x
+            pkg_type: exe
+            artifact_name: jfc_config-win64.exe
+          - os: ubuntu-latest
+            arch: 64x
+            pkg_type: deb
+            artifact_name: jfc_config-linux.deb
+          - os: ubuntu-latest
+            arch: 86x
+            pkg_type: deb
+            artifact_name: jfc_config-linux86.deb
+          - os: fedora-latest
+            arch: 64x
+            pkg_type: rpm
+            artifact_name: jfc_config-linux.rpm
+          - os: macos-latest
+            arch: 64x
+            pkg_type: pkg
+            artifact_name: jfc_config-macos.pkg
+          - os: ubuntu-latest
+            arch: arm64
+            pkg_type: deb
+            artifact_name: jfc_config-termux-arm64.deb
+          - os: ubuntu-latest
+            arch: x86_64
+            pkg_type: deb
+            artifact_name: jfc_config-termux-x86_64.deb
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        if: matrix.arch != 'arm64' && matrix.arch != 'x86_64'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: ${{ matrix.arch == '86x' && 'x86' || 'x64' }}
+
+      - name: Install Dependencies
+        if: matrix.arch != 'arm64' && matrix.arch != 'x86_64'
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller requests urllib3 pyfiglet
+
+      - name: Build Executable (native)
+        if: matrix.arch != 'arm64' && matrix.arch != 'x86_64'
+        run: |
+          pyinstaller --clean --noconfirm \
+            --distpath ./build/${{ matrix.arch }}/${{ matrix.os }} \
+            --workpath ./build/${{ matrix.arch }}/temp \
+            --onefile \
+            --collect-all pyfiglet \
+            --name jfc_config ./src/jfc_confige.py
+
+      - name: Cross-Compile for Termux (multi-arch)
+        if: matrix.arch == 'arm64' || matrix.arch == 'x86_64'
+        run: |
+          docker run --rm -v $PWD:/src -w /src \
+            --platform linux/${{ matrix.arch }} \
+            python:3.11 bash -c "
+              pip install pyinstaller requests urllib3 pyfiglet &&
+              pyinstaller --clean --noconfirm \
+                --distpath ./build/${{ matrix.arch }}/termux \
+                --workpath ./build/${{ matrix.arch }}/temp \
+                --onefile \
+                --collect-all pyfiglet \
+                --name jfc_config ./src/jfc_confige.py
+            "
+
+      - name: Package for Native OS
+        run: |
+          if [ "${{ matrix.pkg_type }}" = "deb" ]; then
+            mkdir -p pkg/DEBIAN
+            echo "Package: jfc-config
+            Version: 1.0
+            Architecture: ${{ matrix.arch }}
+            Maintainer: ratiojuris@duck.com
+            Description: JFC Config tool" > pkg/DEBIAN/control
+            mkdir -p pkg/usr/local/bin
+            cp ./build/${{ matrix.arch }}/${{ matrix.os }}/jfc_config pkg/usr/local/bin/
+            dpkg-deb --build pkg ${{ matrix.artifact_name }}
+          elif [ "${{ matrix.pkg_type }}" = "rpm" ]; then
+            mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+            cp ./build/${{ matrix.arch }}/${{ matrix.os }}/jfc_config ~/rpmbuild/SOURCES/
+            echo "Name: jfc-config
+            Version: 1.0
+            Release: 1
+            Summary: JFC Config tool
+            License: MIT
+            Packager: ratiojuris@duck.com
+            %description
+            JFC Config tool
+            %install
+            mkdir -p %{buildroot}/usr/local/bin
+            cp %{_sourcedir}/jfc_config %{buildroot}/usr/local/bin/
+            %files
+            /usr/local/bin/jfc_config" > ~/rpmbuild/SPECS/jfc-config.spec
+            rpmbuild -bb ~/rpmbuild/SPECS/jfc-config.spec
+            cp ~/rpmbuild/RPMS/x86_64/*.rpm ${{ matrix.artifact_name }}
+          elif [ "${{ matrix.pkg_type }}" = "pkg" ]; then
+            mkdir -p pkg/usr/local/bin
+            cp ./build/${{ matrix.arch }}/${{ matrix.os }}/jfc_config pkg/usr/local/bin/
+            pkgbuild --root pkg --identifier com.ratiojuris.jfc-config --version 1.0 --install-location /usr/local/bin --ownership recommended ${{ matrix.artifact_name }}
+          elif [ "${{ matrix.pkg_type }}" = "exe" ]; then
+            cp ./build/${{ matrix.arch }}/${{ matrix.os }}/jfc_config.exe ${{ matrix.artifact_name }}
+          fi
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        if: startsWith(github.ref, 'refs/tags/')
+        with:
+          files: ${{ matrix.artifact_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
